@@ -3,7 +3,7 @@
 Pytorch implementation
 
 
-This project is built upon facebook@DomainBed.
+This project is built upon facebook@DomainBed and khanrc@MIRO.
 
 ## Preparation
 
