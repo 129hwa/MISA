@@ -28,7 +28,14 @@ import math
 from domainbed.ur_networks import URFeaturizer # for MIRO
 from domainbed.optimizers import get_optimizer # for MIRO
 
-from misa_alg import MISA
+from domainbed.misa_components import (
+    grad_reverse,
+    DomainInformationEncoder,
+    FeatureAttention,
+    LearnableGaborBank,
+    spectral_loss_gabor_edge_features,
+    invert_spectral_loss
+)
 
 ALGORITHMS = [
     'ERM',
@@ -2911,7 +2918,8 @@ def gradient_penalty(D, real, fake):
 
 class MISA(Algorithm):
     def __init__(self, input_shape, num_classes, num_domains, hparams):
-        super(MISA, self).__init__(input_shape, num_classes, num_domains, hparams)
+        super().__init__(input_shape, num_classes, num_domains, hparams)
+        # super(MISA, self).__init__(input_shape, num_classes, num_domains, hparams)
         
         self.featurizer = networks.Featurizer(input_shape, self.hparams)
         self.feature_dim = self.featurizer.n_outputs
