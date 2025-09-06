@@ -28,6 +28,8 @@ import math
 from domainbed.ur_networks import URFeaturizer # for MIRO
 from domainbed.optimizers import get_optimizer # for MIRO
 
+from misa_alg import MISA
+
 ALGORITHMS = [
     'ERM',
     'ERMPlusPlus',
