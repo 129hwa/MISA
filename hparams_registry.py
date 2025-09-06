@@ -2,6 +2,7 @@
 import numpy as np
 from domainbed.lib import misc
 
+from misa_hparams import get_misa_hparams
 
 def _define_hparam(hparams, hparam_name, default_val, random_val_fn):
     hparams[hparam_name] = (hparams, hparam_name, default_val, random_val_fn)
@@ -174,34 +175,37 @@ def _hparams(algorithm, dataset, random_seed):
     
     elif algorithm == "MISA":
         # MISA architecture hyperparameters
-        _hparam('latent_dim', 512, lambda r: int(2 ** r.uniform(7, 10)))
-        _hparam('attention_heads', 4, lambda r: int(r.choice([2, 4, 8])))
-        _hparam('dropout_rate', 0.3, lambda r: r.uniform(0.1, 0.5))
+        # _hparam('latent_dim', 512, lambda r: int(2 ** r.uniform(7, 10)))
+        # _hparam('attention_heads', 4, lambda r: int(r.choice([2, 4, 8])))
+        # _hparam('dropout_rate', 0.3, lambda r: r.uniform(0.1, 0.5))
         
-        # MISA loss weights
-        _hparam('lambda_task', 1.0, lambda r: 1.0)
-        _hparam('lambda_inv_adv', 0.1, lambda r: 10 ** r.uniform(-2, 0))
-        _hparam('lambda_spc_clf', 0.1, lambda r: 10 ** r.uniform(-2, 0))
-        _hparam('lambda_disentangle', 0.05, lambda r: 10 ** r.uniform(-3, -1))
-        _hparam('lambda_reconstruct', 0.05, lambda r: 10 ** r.uniform(-3, -1))
+        # # MISA loss weights
+        # _hparam('lambda_task', 1.0, lambda r: 1.0)
+        # _hparam('lambda_inv_adv', 0.1, lambda r: 10 ** r.uniform(-2, 0))
+        # _hparam('lambda_spc_clf', 0.1, lambda r: 10 ** r.uniform(-2, 0))
+        # _hparam('lambda_disentangle', 0.05, lambda r: 10 ** r.uniform(-3, -1))
+        # _hparam('lambda_reconstruct', 0.05, lambda r: 10 ** r.uniform(-3, -1))
         
-        # CLIP 관련 하이퍼파라미터
-        _hparam('use_clip', False, lambda r: r.choice([True, False]))
-        _hparam('clip_model_name', 'ViT-B/32', 
-                lambda r: r.choice(['ViT-B/32', 'ViT-B/16', 'ViT-L/14', 'RN50']))
-        _hparam('freeze_clip', True, lambda r: r.choice([True, False]))
-        _hparam('lr_clip', 1e-5, lambda r: 10 ** r.uniform(-6, -3))  # CLIP fine-tuning LR
+        # # CLIP 관련 하이퍼파라미터
+        # _hparam('use_clip', False, lambda r: r.choice([True, False]))
+        # _hparam('clip_model_name', 'ViT-B/32', 
+        #         lambda r: r.choice(['ViT-B/32', 'ViT-B/16', 'ViT-L/14', 'RN50']))
+        # _hparam('freeze_clip', True, lambda r: r.choice([True, False]))
+        # _hparam('lr_clip', 1e-5, lambda r: 10 ** r.uniform(-6, -3))  # CLIP fine-tuning LR
 
-        # GRL parameters
-        _hparam('grl_alpha_max', 1.0, lambda r: r.uniform(0.5, 2.0))
-        _hparam('grl_warmup_epochs', 1000, lambda r: int(r.uniform(500, 2000)))
+        # # GRL parameters
+        # _hparam('grl_alpha_max', 1.0, lambda r: r.uniform(0.5, 2.0))
+        # _hparam('grl_warmup_epochs', 1000, lambda r: int(r.uniform(500, 2000)))
         
-        # Spectral loss parameters
-        _hparam('use_spectral_loss', True, lambda r: r.choice([True, False]))
-        _hparam('lambda_spectral_inv', 0.1, lambda r: 10 ** r.uniform(-2, 0))
-        _hparam('lambda_spectral_spc', 0.1, lambda r: 10 ** r.uniform(-2, 0))
-        _hparam('gabor_num_filters', 8, lambda r: int(r.choice([4, 8, 16])))
-        _hparam('gabor_kernel_size', 11, lambda r: int(r.choice([7, 11, 15])))
+        # # Spectral loss parameters
+        # _hparam('use_spectral_loss', True, lambda r: r.choice([True, False]))
+        # _hparam('lambda_spectral_inv', 0.1, lambda r: 10 ** r.uniform(-2, 0))
+        # _hparam('lambda_spectral_spc', 0.1, lambda r: 10 ** r.uniform(-2, 0))
+        # _hparam('gabor_num_filters', 8, lambda r: int(r.choice([4, 8, 16])))
+        # _hparam('gabor_kernel_size', 11, lambda r: int(r.choice([7, 11, 15])))
+        misa_hparams = get_misa_hparams(dataset, random_seed if random_seed > 0 else None)
+        for key, value in misa_hparams.items():
+            _hparam(key, value, lambda r: value)
 
     elif algorithm == 'URM':
         _hparam('urm', 'adversarial', lambda r: str(r.choice(['adversarial']))) # 'adversarial'
