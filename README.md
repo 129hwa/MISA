@@ -19,16 +19,22 @@ python -m domainbed.scripts.download --data_dir=/my/datasets/path
 
 ### How to Run
 ```python
-for TEST_ENV in 0 1 2 3; do
-    OUTPUT_DIR="/my/results/path"
+# 기존 알고리즘들 실행 DomainNet ver.
+for ALGORITHM in 'IRM' 'GroupDRO' 'Mixup' 'MLDG' 'CORAL' 'MMD' 'DANN'; do
+ for TEST_ENV in 0 1 2 3; do
+   echo "Training $ALGORITHM on $DATASET with test environment $TEST_ENV"
+   OUTPUT_DIR="/home/elicer/DomainBed/results/DomainNet/${ALGORITHM}/env${TEST_ENV}"
     mkdir -p $OUTPUT_DIR
     python -m domainbed.scripts.train \
-        --dataset PACS \
-        --algorithm=MISA \
-        --test_envs $TEST_ENV \
-        --data_dir=$DATA_DIR \
-        --output_dir=$OUTPUT_DIR \
-        --seed=0 \
-    > output.log 2> error.log
+      --dataset DomainNet \
+      --algorithm=$ALGORITHM \
+      --test_envs $TEST_ENV \
+      --data_dir=$DATA_DIR \
+      --output_dir=$OUTPUT_DIR \
+      --steps=5000 \
+      --checkpoint_freq=100 \
+      --seed=1 \
+      > output_${TEST_ENV}_DN_${ALGORITHM}.log 2> error_${TEST_ENV}_s1_${ALGORITHM}.log
+  done
 done
 ```
