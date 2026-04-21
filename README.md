@@ -32,3 +32,10 @@ python -m domainbed.scripts.sweep launch \
       --skip_confirmation \
       2>&1 | tee "${SWEEP_OUTPUT_DIR}/sweep_log.log"
 ```
+
+### Collect results
+```python
+python -m domainbed.scripts.collect_results \
+    --input_dir ./sweep_output \
+    --latex
+```
