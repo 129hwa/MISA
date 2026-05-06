@@ -26,9 +26,8 @@ python -m domainbed.scripts.sweep launch \
       --algorithms MISA \
       --datasets VLCS \
       --n_hparams 1 \
-      --n_trials 1 \
+      --n_trials 3 \
       --steps 4000 \
-      --seed 0 \
       --skip_confirmation \
       2>&1 | tee "${SWEEP_OUTPUT_DIR}/sweep_log.log"
 ```
