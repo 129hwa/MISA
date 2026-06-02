@@ -10,6 +10,10 @@ import copy
 
 import timm
 
+import clip
+
+from torchvision.models import resnet18, ResNet18_Weights
+from torchvision.models import resnet50, ResNet50_Weights
 
 def remove_batch_norm_from_resnet(model):
     fuse = torch.nn.utils.fusion.fuse_conv_bn_eval
@@ -110,10 +114,12 @@ class ResNet(torch.nn.Module):
     def __init__(self, input_shape, hparams):
         super(ResNet, self).__init__()
         if hparams['resnet18']:
-            self.network = torchvision.models.resnet18(pretrained=True)
+            # self.network = torchvision.models.resnet18(pretrained=True)
+            self.network = resnet18(weights=ResNet18_Weights.IMAGENET1K_V1)
             self.n_outputs = 512
         else:
-            self.network = torchvision.models.resnet50(pretrained=True)
+            #self.network = torchvision.models.resnet50(pretrained=True)
+            self.network = resnet50(weights=ResNet50_Weights.IMAGENET1K_V1)
             self.n_outputs = 2048
 
         if hparams['resnet50_augmix']:
@@ -339,7 +345,7 @@ class FeatureAttention(nn.Module):
         mlp_output = self.mlp(z_after_attn_norm)
         return self.norm2(mlp_output)
 
-# MIAS Model with CLIP Backbone
+# MISA Model with CLIP Backbone
 class MISA_DG_Model_CLIP(nn.Module):
     def __init__(self, input_shape, num_classes, num_domains, hparams):
         super(MISA_DG_Model_CLIP, self).__init__()
@@ -470,9 +476,6 @@ class MISA_DG_Model_CLIP(nn.Module):
                 print(f"리사이즈된 이미지 shape: {x.shape}")
                 self.resized_shape_logged = True
         
-        # 이미지 정규화가 필요한 경우 추가 (DomainBed와 CLIP의 정규화 차이 처리)
-        # 정규화 코드는 필요에 따라 여기에 추가...
-        
         return x
         
     def forward(self, x, alpha=1.0):
@@ -553,18 +556,15 @@ class CLIPFeaturizer(torch.nn.Module):
         super(CLIPFeaturizer, self).__init__()
         self.hparams = hparams
         
-        # CLIP 모델 로드
         try:
             self.clip_model, self.clip_preprocess = clip.load(
                 hparams.get('clip_model_name', 'ViT-B/32'), 
-                device='cpu',  # 초기에는 CPU에 로드
+                device='cpu', 
                 jit=False
             )
             
-            # Visual encoder만 사용
             self.visual_encoder = self.clip_model.visual
             
-            # 출력 차원 계산
             dummy_input = torch.randn(1, 3, 224, 224)
             if hasattr(self.visual_encoder, 'conv1') and hasattr(self.visual_encoder.conv1, 'weight'):
                 # ResNet-like
@@ -579,7 +579,6 @@ class CLIPFeaturizer(torch.nn.Module):
                 dummy_output = self.visual_encoder(dummy_input.type(self.clip_dtype))
             self.n_outputs = dummy_output.shape[-1]
             
-            # Freeze/Unfreeze 설정
             if hparams.get('freeze_clip', True):
                 for param in self.visual_encoder.parameters():
                     param.requires_grad = False
@@ -593,7 +592,8 @@ class CLIPFeaturizer(torch.nn.Module):
             # Fallback to ResNet
             self.visual_encoder = None
             self.use_clip = False
-            resnet = torchvision.models.resnet50(pretrained=True)
+            # resnet = torchvision.models.resnet50(pretrained=True)
+            resnet = resnet50(weights=ResNet50_Weights.IMAGENET1K_V1)
             self.backbone = nn.Sequential(*list(resnet.children())[:-1])
             self.n_outputs = 2048
         else:
@@ -603,13 +603,12 @@ class CLIPFeaturizer(torch.nn.Module):
 
     def forward(self, x):
         if self.use_clip:
-            # CLIP의 dtype에 맞춰 입력 변환
             if self.visual_encoder.training or not self.hparams.get('freeze_clip', True):
                 features = self.visual_encoder(x.type(self.clip_dtype))
             else:
                 with torch.no_grad():
                     features = self.visual_encoder(x.type(self.clip_dtype))
-            features = features.float()  # 다음 layer를 위해 float32로 변환
+            features = features.float() 
         else:
             # Fallback ResNet
             features = self.backbone(x)
@@ -623,12 +622,12 @@ class CLIPFeaturizer(torch.nn.Module):
         if self.use_clip and self.hparams.get('freeze_clip', True):
             self.visual_encoder.eval()  # Keep frozen CLIP in eval mode
 
-# Featurizer 함수 수정
 def Featurizer(input_shape, hparams):
     """Auto-select an appropriate featurizer for the given input shape."""
-    # CLIP 사용 여부 체크
     if hparams.get('use_clip', False):
         return CLIPFeaturizer(input_shape, hparams)
+
+
     elif len(input_shape) == 1:
         return MLP(input_shape[0], hparams["mlp_width"], hparams)
     elif input_shape[1:3] == (28, 28):
@@ -646,22 +645,65 @@ def Featurizer(input_shape, hparams):
         raise NotImplementedError
 
 
-# (선택) domainbed/networks.py 에 다음 클래스 추가
-
-import clip
-
 class CLIPFeaturizer(nn.Module):
     def __init__(self, input_shape, hparams):
         super(CLIPFeaturizer, self).__init__()
         device = "cuda" if torch.cuda.is_available() else "cpu"
         self.clip_model, self.preprocess = clip.load("ViT-B/32", device=device)
-        # CLIP 모델의 vision output dimension
         self.n_outputs = self.clip_model.visual.output_dim
 
     def forward(self, x):
-        # DomainBed의 입력 이미지(x)는 이미 [B,3,H,W] normalized 상태로 넘어옴을 가정
-        # CLIP 이미지 인코더의 forward는 normalize + resize 논리 포함되어 있지 않으므로,
-        # DomainBed 데이터셋 측에서 CLIP preprocessing을 동일하게 맞추어야 함.
         with torch.no_grad():
-            # x가 이미 clip preprocessing을 거쳤다면 바로 encode_image 호출
             return self.clip_model.encode_image(x)
+
+
+# ============================================================
+# CLIP Featurizer (frozen, with input renormalization)
+# ============================================================
+class CLIPFeaturizer(nn.Module):
+
+    def __init__(self, input_shape, hparams):
+        super(CLIPFeaturizer, self).__init__()
+        device = "cuda" if torch.cuda.is_available() else "cpu"
+        model_name = hparams.get('clip_model_name', 'ViT-B/32')
+        self.clip_model, self.preprocess = clip.load(
+            model_name, device=device)
+        
+        # CLIP output dim
+        # (ViT-B/32, ViT-B/16: 512; ViT-L/14: 768)
+        self.n_outputs = self.clip_model.visual.output_dim
+        
+        imagenet_mean = torch.tensor(
+            [0.485, 0.456, 0.406]).view(1, 3, 1, 1)
+        imagenet_std  = torch.tensor(
+            [0.229, 0.224, 0.225]).view(1, 3, 1, 1)
+        clip_mean = torch.tensor(
+            [0.48145466, 0.4578275, 0.40821073]).view(1, 3, 1, 1)
+        clip_std  = torch.tensor(
+            [0.26862954, 0.26130258, 0.27577711]).view(1, 3, 1, 1)
+        
+        self.register_buffer('std_ratio',
+            imagenet_std / clip_std)
+        self.register_buffer('mean_offset',
+            (imagenet_mean - clip_mean) / clip_std)
+        
+        # Freeze: no gradients flow through CLIP
+        for p in self.clip_model.parameters():
+            p.requires_grad = False
+    
+    def forward(self, x):
+        # Re-normalize from ImageNet stats to CLIP stats
+        x = x * self.std_ratio + self.mean_offset
+        
+        # Forward through frozen CLIP visual encoder
+        with torch.no_grad():
+            features = self.clip_model.encode_image(x)
+        
+        # CLIP returns float16 on CUDA; cast to float32
+        return features.float()
+    
+    def train(self, mode=True):
+        """Override: keep CLIP in eval mode always (frozen)."""
+        super().train(mode)
+        self.clip_model.eval()
+        return self
