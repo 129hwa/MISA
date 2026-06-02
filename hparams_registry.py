@@ -2,7 +2,7 @@
 import numpy as np
 from domainbed.lib import misc
 
-from misa_hparams import get_misa_hparams
+# from misa_algorithm import MISA
 
 def _define_hparam(hparams, hparam_name, default_val, random_val_fn):
     hparams[hparam_name] = (hparams, hparam_name, default_val, random_val_fn)
@@ -116,6 +116,22 @@ def _hparams(algorithm, dataset, random_seed):
     elif algorithm == "SD":
         _hparam('sd_reg', 0.1, lambda r: 10**r.uniform(-5, -1))
 
+
+    ###########################################################################################
+    elif algorithm == "CLIP":
+        _hparam('prompt', 'class_name', lambda r: r.choice(['class_name', 'domain_name']))
+        
+    elif algorithm in ["DPLCLIP"]:
+        _hparam('clip_backbone', 'ViT-B/16',
+            lambda r: r.choice(['ViT-B/16']))
+        _hparam('num_domain_tokens', 16, lambda r: int(r.choice([2, 4, 8, 16])))  # the parameter should be int, not numpy.int, due to dump into results.jsonl.
+        # MLP
+        _hparam('mlp_depth', 3, lambda r: int(r.choice([3])))
+        _hparam('mlp_width', 512, lambda r: int(r.choice([256, 512])))
+        _hparam('mlp_dropout', 0.1, lambda r: r.choice([0.0, 0.1]))
+    
+
+    #############################################################################################
     elif algorithm == "ANDMask":
         _hparam('tau', 1, lambda r: r.uniform(0.5, 1.))
 
@@ -175,37 +191,34 @@ def _hparams(algorithm, dataset, random_seed):
     
     elif algorithm == "MISA":
         # MISA architecture hyperparameters
-        # _hparam('latent_dim', 512, lambda r: int(2 ** r.uniform(7, 10)))
-        # _hparam('attention_heads', 4, lambda r: int(r.choice([2, 4, 8])))
-        # _hparam('dropout_rate', 0.3, lambda r: r.uniform(0.1, 0.5))
+        _hparam('latent_dim', 512, lambda r: int(2 ** r.uniform(7, 10)))
+        _hparam('attention_heads', 4, lambda r: int(r.choice([2, 4, 8])))
+        _hparam('dropout_rate', 0.3, lambda r: r.uniform(0.1, 0.5))
         
-        # # MISA loss weights
-        # _hparam('lambda_task', 1.0, lambda r: 1.0)
-        # _hparam('lambda_inv_adv', 0.1, lambda r: 10 ** r.uniform(-2, 0))
-        # _hparam('lambda_spc_clf', 0.1, lambda r: 10 ** r.uniform(-2, 0))
-        # _hparam('lambda_disentangle', 0.05, lambda r: 10 ** r.uniform(-3, -1))
-        # _hparam('lambda_reconstruct', 0.05, lambda r: 10 ** r.uniform(-3, -1))
+        # MISA loss weights
+        _hparam('lambda_task', 1.0, lambda r: 1.0)
+        _hparam('lambda_inv_adv', 0.1, lambda r: 10 ** r.uniform(-2, 0))
+        _hparam('lambda_spc_clf', 0.1, lambda r: 10 ** r.uniform(-2, 0))
+        _hparam('lambda_disentangle', 0.05, lambda r: 10 ** r.uniform(-3, -1))
+        _hparam('lambda_reconstruct', 0.05, lambda r: 10 ** r.uniform(-3, -1))
         
-        # # CLIP 관련 하이퍼파라미터
-        # _hparam('use_clip', False, lambda r: r.choice([True, False]))
-        # _hparam('clip_model_name', 'ViT-B/32', 
-        #         lambda r: r.choice(['ViT-B/32', 'ViT-B/16', 'ViT-L/14', 'RN50']))
-        # _hparam('freeze_clip', True, lambda r: r.choice([True, False]))
-        # _hparam('lr_clip', 1e-5, lambda r: 10 ** r.uniform(-6, -3))  # CLIP fine-tuning LR
+        # CLIP 관련 하이퍼파라미터
+        _hparam('use_clip', False, lambda r: r.choice([True, False]))
+        _hparam('clip_model_name', 'ViT-B/32', 
+                lambda r: r.choice(['ViT-B/32', 'ViT-B/16', 'ViT-L/14', 'RN50']))
+        _hparam('freeze_clip', True, lambda r: r.choice([True, False]))
+        _hparam('lr_clip', 1e-5, lambda r: 10 ** r.uniform(-6, -3))  # CLIP fine-tuning LR
 
-        # # GRL parameters
-        # _hparam('grl_alpha_max', 1.0, lambda r: r.uniform(0.5, 2.0))
-        # _hparam('grl_warmup_epochs', 1000, lambda r: int(r.uniform(500, 2000)))
+        # GRL parameters
+        _hparam('grl_alpha_max', 1.0, lambda r: r.uniform(0.5, 2.0))
+        _hparam('grl_warmup_epochs', 1000, lambda r: int(r.uniform(500, 2000)))
         
-        # # Spectral loss parameters
-        # _hparam('use_spectral_loss', True, lambda r: r.choice([True, False]))
-        # _hparam('lambda_spectral_inv', 0.1, lambda r: 10 ** r.uniform(-2, 0))
-        # _hparam('lambda_spectral_spc', 0.1, lambda r: 10 ** r.uniform(-2, 0))
-        # _hparam('gabor_num_filters', 8, lambda r: int(r.choice([4, 8, 16])))
-        # _hparam('gabor_kernel_size', 11, lambda r: int(r.choice([7, 11, 15])))
-        misa_hparams = get_misa_hparams(dataset, random_seed if random_seed > 0 else None)
-        for key, value in misa_hparams.items():
-            _hparam(key, value, lambda r: value)
+        # Spectral loss parameters
+        _hparam('use_spectral_loss', True, lambda r: r.choice([True, False]))
+        _hparam('lambda_spectral_inv', 0.1, lambda r: 10 ** r.uniform(-2, 0))
+        _hparam('lambda_spectral_spc', 0.1, lambda r: 10 ** r.uniform(-2, 0))
+        _hparam('gabor_num_filters', 8, lambda r: int(r.choice([4, 8, 16])))
+        _hparam('gabor_kernel_size', 11, lambda r: int(r.choice([7, 11, 15])))
 
     elif algorithm == 'URM':
         _hparam('urm', 'adversarial', lambda r: str(r.choice(['adversarial']))) # 'adversarial'
@@ -233,11 +246,12 @@ def _hparams(algorithm, dataset, random_seed):
         _hparam('mlp_depth', 9, lambda r: int(r.choice([8, 9, 10])))
         _hparam('mlp_dropout', 0., lambda r: r.choice([0]))
 
-
     # Dataset-and-algorithm-specific hparam definitions. Each block of code
     # below corresponds to exactly one hparam. Avoid nested conditionals.
 
-    if dataset in SMALL_IMAGES:
+    if algorithm == "DPLCLIP":
+        _hparam('lr', 1e-3, lambda r: 10**r.uniform(-4.5, -2.5))
+    elif dataset in SMALL_IMAGES:
         if algorithm == "ADRMX":
             _hparam('lr', 3e-3, lambda r: r.choice([5e-4, 1e-3, 2e-3, 3e-3]))
         else:
@@ -247,8 +261,12 @@ def _hparams(algorithm, dataset, random_seed):
             _hparam('lr', 3e-5, lambda r: r.choice([2e-5, 3e-5, 4e-5, 5e-5]))
         else:
             _hparam('lr', 5e-5, lambda r: 10**r.uniform(-5, -3.5))
-
-    if dataset in SMALL_IMAGES:
+    
+    
+    if algorithm == "DPLCLIP":
+        _hparam('weight_decay', 0., lambda r: 0.)
+        _hparam('momentum', 0.1, lambda r: r.choice([0.0, 0.1, 0.2]))
+    elif dataset in SMALL_IMAGES:
         _hparam('weight_decay', 0., lambda r: 0.)
     else:
         _hparam('weight_decay', 0., lambda r: 10**r.uniform(-6, -2))
@@ -259,13 +277,13 @@ def _hparams(algorithm, dataset, random_seed):
         _hparam('batch_size', 8, lambda r: 8)
     elif algorithm == 'RDM':
         if dataset in ['DomainNet', 'TerraIncognita']:
-            _hparam('batch_size', 40, lambda r: int(r.uniform(30, 60)))
+            _hparam('batch_size', 60, lambda r: int(r.uniform(30, 60)))
         else:
-            _hparam('batch_size', 88, lambda r: int(r.uniform(70, 100)))
+            _hparam('batch_size', 100, lambda r: int(r.uniform(70, 100)))
     elif dataset == 'DomainNet':
-        _hparam('batch_size', 32, lambda r: int(2**r.uniform(3, 5)))
+        _hparam('batch_size', 128, lambda r: int(2**r.uniform(3, 5)))
     else:
-        _hparam('batch_size', 32, lambda r: int(2**r.uniform(3, 5.5)))
+        _hparam('batch_size', 64, lambda r: int(2**r.uniform(3, 5.5)))
 
     if algorithm in ['DANN', 'CDANN'] and dataset in SMALL_IMAGES:
         _hparam('lr_g', 1e-3, lambda r: 10**r.uniform(-4.5, -2.5))
