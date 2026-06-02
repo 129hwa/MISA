@@ -5,6 +5,8 @@ import torch.nn as nn
 import torchvision.models
 import clip
 
+from torchvision.models import resnet18, ResNet18_Weights
+from torchvision.models import resnet50, ResNet50_Weights
 
 def clip_imageencoder(name):
     model, _preprocess = clip.load(name, device="cpu")
@@ -39,16 +41,20 @@ def get_backbone(name, preserve_readout, pretrained):
         assert name in ["resnet50", "swag_regnety_16gf"], "Only RN50/RegNet supports non-pretrained network"
 
     if name == "resnet18":
-        network = torchvision.models.resnet18(pretrained=True)
+        # network = torchvision.models.resnet18(pretrained=True)
+        network = resnet18(weights=ResNet18_Weights.IMAGENET1K_V1)
+
         n_outputs = 512
     elif name == "resnet50":
-        network = torchvision.models.resnet50(pretrained=pretrained)
+        # network = torchvision.models.resnet50(pretrained=pretrained)
+        network = resnet50(weights=ResNet50_Weights.IMAGENET1K_V1)
         n_outputs = 2048
     elif name == "resnet50_barlowtwins":
         network = torch.hub.load('facebookresearch/barlowtwins:main', 'resnet50')
         n_outputs = 2048
     elif name == "resnet50_moco":
-        network = torchvision.models.resnet50()
+        # network = torchvision.models.resnet50()
+        network = resnet50(weights=None)
 
         # download pretrained model of MoCo v3: https://dl.fbaipublicfiles.com/moco-v3/r-50-1000ep/r-50-1000ep.pth.tar
         ckpt_path = "./r-50-1000ep.pth.tar"
