@@ -37,6 +37,9 @@ from domainbed.misa_components import (
     invert_spectral_loss
 )
 
+import clip
+
+
 ALGORITHMS = [
     'ERM',
     'ERMPlusPlus',
@@ -72,6 +75,9 @@ ALGORITHMS = [
     'RDM',
     'ADRMX',
     'URM',
+    ##################
+    'CLIP',
+    'DPLCLIP',
     ##################
     'MISA',
     ##################
@@ -2570,611 +2576,6 @@ class ADRMX(Algorithm):
     def predict(self, x):
         return self.network(x)
 
-############################################################################################
-class GradReverse(torch.autograd.Function):
-    @staticmethod
-    def forward(ctx, x, alpha):
-        ctx.alpha = alpha
-        return x.view_as(x)
-
-    @staticmethod
-    def backward(ctx, grad_output):
-        return grad_output.neg() * ctx.alpha, None
-
-def grad_reverse(x, alpha=1.0):
-    return GradReverse.apply(x, alpha)
-
-class DomainInformationEncoder(nn.Module):
-    def __init__(self, feature_dim, output_dim, dropout_rate=0.3):
-        super().__init__()
-        self.encoder = nn.Sequential(
-            nn.Linear(feature_dim, feature_dim // 2),
-            nn.BatchNorm1d(feature_dim // 2),
-            nn.ReLU(inplace=True),
-            nn.Dropout(dropout_rate),
-            nn.Linear(feature_dim // 2, output_dim)
-        )
-    
-    def forward(self, z_features):
-        return self.encoder(z_features)
-
-class FeatureAttention(nn.Module):
-    def __init__(self, feature_dim, context_dim, num_heads, output_dim, dropout_rate=0.3):
-        super().__init__()
-        self.attention = nn.MultiheadAttention(
-            embed_dim=feature_dim, 
-            num_heads=num_heads,
-            kdim=context_dim, 
-            vdim=context_dim, 
-            batch_first=True,
-            dropout=dropout_rate
-        )
-        self.norm1 = nn.LayerNorm(feature_dim)
-        self.mlp = nn.Sequential(
-            nn.Linear(feature_dim, feature_dim * 2),
-            nn.ReLU(inplace=True),
-            nn.Dropout(dropout_rate),
-            nn.Linear(feature_dim * 2, output_dim)
-        )
-        self.norm2 = nn.LayerNorm(output_dim)
-
-    def forward(self, z_query_features, context_kv_features):
-        z_q_unsqueeze = z_query_features.unsqueeze(1)
-        context_kv_unsqueeze = context_kv_features.unsqueeze(1)
-        
-        attn_output, _ = self.attention(z_q_unsqueeze, context_kv_unsqueeze, context_kv_unsqueeze)
-        attn_output = attn_output.squeeze(1)
-        
-        z_after_attn_norm = self.norm1(z_query_features + attn_output)
-        mlp_output = self.mlp(z_after_attn_norm)
-        final_output = self.norm2(mlp_output)
-        
-        return final_output
-
-class LearnableGaborBank(nn.Module):
-    def __init__(self, num_filters=8, kernel_size=11):
-        super(LearnableGaborBank, self).__init__()
-        self.num_filters = num_filters
-        self.kernel_size = kernel_size
-        self.sigma = nn.Parameter(torch.full((num_filters,), 4.0))
-        init_theta = torch.linspace(0, math.pi * (1 - 1/num_filters), steps=num_filters)
-        self.theta = nn.Parameter(init_theta)
-        self.lambd = nn.Parameter(torch.full((num_filters,), 10.0))
-        self.gamma = nn.Parameter(torch.full((num_filters,), 0.5))
-        self.psi = nn.Parameter(torch.zeros(num_filters))
-    
-    def forward(self, device):
-        kernels = []
-        half_size = self.kernel_size // 2
-        y, x = torch.meshgrid(torch.arange(-half_size, half_size+1),
-                              torch.arange(-half_size, half_size+1), indexing='ij')
-        x = x.float().to(device)
-        y = y.float().to(device)
-        for i in range(self.num_filters):
-            sigma = self.sigma[i]
-            theta = self.theta[i]
-            lambd = self.lambd[i]
-            gamma = self.gamma[i]
-            psi = self.psi[i]
-            x_theta = x * torch.cos(theta) + y * torch.sin(theta)
-            y_theta = -x * torch.sin(theta) + y * torch.cos(theta)
-            exp_term = torch.exp(-0.5 * (x_theta**2 + (gamma**2) * (y_theta**2)) / (sigma**2))
-            cos_term = torch.cos(2 * math.pi * x_theta / lambd + psi)
-            kernel = exp_term * cos_term
-            kernels.append(kernel.unsqueeze(0).unsqueeze(0))
-        gabor_bank = torch.cat(kernels, dim=0)
-        return gabor_bank
-
-# Spectral Loss 관련 함수들
-def features_to_image(features, height=None, width=None):
-    batch_size, feature_dim = features.shape
-    
-    if height is None or width is None:
-        side_length = int(math.sqrt(feature_dim))
-        if side_length * side_length < feature_dim:
-            side_length += 1
-        height = width = side_length
-    
-    padded_size = height * width
-    if padded_size > feature_dim:
-        padding = torch.zeros(batch_size, padded_size - feature_dim, device=features.device)
-        features_padded = torch.cat([features, padding], dim=1)
-    else:
-        features_padded = features[:, :padded_size]
-    
-    return features_padded.view(batch_size, 1, height, width)
-
-def spectral_loss_gabor_edge_features(features, domain_labels, learnable_gabor, epsilon=1e-8):
-    img_size = int(math.ceil(math.sqrt(features.shape[1])))
-    x_gray = features_to_image(features, img_size, img_size)
-    
-    gabor_bank = learnable_gabor(features.device)
-    pad = learnable_gabor.kernel_size // 2
-    gabor_response = F.conv2d(x_gray, gabor_bank, padding=pad)
-    gabor_response = torch.abs(gabor_response)
-    
-    sobel_x = torch.tensor([[-1., 0., 1.], [-2., 0., 2.], [-1., 0., 1.]], 
-                         device=features.device).unsqueeze(0).unsqueeze(0)
-    sobel_y = torch.tensor([[-1., -2., -1.], [0., 0., 0.], [1., 2., 1.]], 
-                         device=features.device).unsqueeze(0).unsqueeze(0)
-    edge_x = F.conv2d(x_gray, sobel_x, padding=1)
-    edge_y = F.conv2d(x_gray, sobel_y, padding=1)
-    edge_map = torch.sqrt(edge_x**2 + edge_y**2 + epsilon)
-    
-    features_combined = torch.cat([gabor_response, edge_map], dim=1)
-    features_flat = features_combined.mean(dim=[2,3])
-    
-    feat_mean = features_flat.mean(dim=1, keepdim=True)
-    feat_std = features_flat.std(dim=1, keepdim=True) + epsilon
-    features_norm = (features_flat - feat_mean) / feat_std
-    
-    unique_domains = torch.unique(domain_labels)
-    domain_means = []
-    
-    for d in unique_domains:
-        mask = (domain_labels == d)
-        if mask.sum() == 0:
-            continue
-        domain_mean = features_norm[mask].mean(dim=0)
-        domain_means.append(domain_mean)
-    
-    if len(domain_means) < 2:
-        return 0.0 * features.sum()
-    
-    loss = 0.0
-    count = 0
-    for i in range(len(domain_means)):
-        for j in range(i+1, len(domain_means)):
-            diff = domain_means[i] - domain_means[j]
-            loss += torch.sum(diff**2) / features_norm.shape[1]
-            count += 1
-    
-    return loss / count if count > 0 else 0.0 * features.sum()
-
-def invert_spectral_loss(loss_value):
-    return 1.0 / (1.0 + 10.0 * loss_value)
-
-# ───────────────────────────────────────────────────────────────────────
-# CLIPFeaturizer: CLIP 모델을 이용해 이미지를 512차원 벡터로 변환
-# ───────────────────────────────────────────────────────────────────────
-class CLIPFeaturizer(nn.Module):
-    """
-    CLIP 모델을 이용해 이미지를 임베딩 벡터로 변환하는 역할
-    - model_name: "ViT-B/32", "RN50", 등 CLIP이 지원하는 모델 이름
-    - 출력 차원: self.output_dim (보통 512)
-    """
-    def __init__(self, model_name="ViT-B/32", device="cuda"):
-        super(CLIPFeaturizer, self).__init__()
-        self.device = device
-
-        # CLIP 모델과 전처리 함수 불러오기
-        self.clip_model, self.preprocess = clip.load(model_name, device=device)
-        # CLIP 백본만 사용하고, 파라미터를 업데이트하지 않음
-        self.clip_model.eval()
-        for param in self.clip_model.parameters():
-            param.requires_grad = False
-
-        # CLIP 시각(backbone) 출력 차원 (보통 512)
-        try:
-            self.output_dim = self.clip_model.visual.output_dim
-        except AttributeError:
-            self.output_dim = self.clip_model.visual.attnpool.c_proj.out_features
-
-    def forward(self, x: torch.Tensor):
-        """
-        x: 원본 이미지 배치 (torch.Tensor, shape [B, 3, H, W], [0,1] 범위)
-        반환: CLIP 임베딩 (shape [B, output_dim])
-        """
-        # CLIP 기준 정규화(Mean/Std) 적용
-        clip_mean = torch.tensor([0.48145466, 0.4578275, 0.40821073], device=self.device).view(1,3,1,1)
-        clip_std  = torch.tensor([0.26862954, 0.26130258, 0.27577711], device=self.device).view(1,3,1,1)
-        x = (x - clip_mean) / clip_std
-
-        with torch.no_grad():
-            image_features = self.clip_model.encode_image(x)  # [B, output_dim]
-            image_features = image_features / image_features.norm(dim=-1, keepdim=True)
-
-        return image_features  # [B, output_dim]
-
-
-# ───────────────────────────────────────────────────────────────────────
-# MINE_Estimator: Mutual Information Neural Estimator (InfoNCE 기반)
-# ───────────────────────────────────────────────────────────────────────
-class MINE_Estimator(nn.Module):
-    """
-    Mutual Information Neural Estimator (MINE)
-    - InfoNCE 기반 lower bound를 사용하여 I(Z; Label) 상호 정보를 근사 추정합니다.
-    - 논문: Belghazi et al. (2018), "Mutual Information Neural Estimation"
-    """
-    def __init__(self, z_dim, label_dim, hidden_dim=512):
-        super(MINE_Estimator, self).__init__()
-        self.net = nn.Sequential(
-            nn.Linear(z_dim + label_dim, hidden_dim),
-            nn.ReLU(inplace=True),
-            nn.Linear(hidden_dim, hidden_dim),
-            nn.ReLU(inplace=True),
-            nn.Linear(hidden_dim, 1)
-        )
-
-    def forward(self, z, labels):
-        """
-        z: Tensor of shape [B, z_dim]
-        labels: Tensor of shape [B, label_dim] (one-hot)
-        return: scalar Tensor (MI lower bound estimate)
-        """
-        batch_size = z.size(0)
-        # Positive pairs: (z[i], labels[i]) → joint 분포 샘플
-        joint = torch.cat([z, labels], dim=1)      # [B, z_dim + label_dim]
-        T_pos = self.net(joint).clamp(max=20, min=-20)  # [B,1]
-
-        # Negative pairs: labels를 shuffle하여 marginal 분포 샘플 생성
-        shuffled_idx = torch.randperm(batch_size, device=z.device)
-        labels_neg = labels[shuffled_idx]          # [B, label_dim]
-        marg = torch.cat([z, labels_neg], dim=1)   # [B, z_dim + label_dim]
-        T_neg = self.net(marg).clamp(max=20, min=-20)  # [B,1]
-
-        # InfoNCE lower bound: I ≥ E[T_pos] - log(E[exp(T_neg)])
-        T_neg_flat = T_neg.view(-1)
-        max_neg = T_neg_flat.max()
-        lse = max_neg + (T_neg_flat - max_neg).exp().mean().log()
-        mi_est = T_pos.mean() - lse
-        return mi_est
-
-
-# ───────────────────────────────────────────────────────────────────────
-# DomainInformationEncoder: 도메인별 컨텍스트(z_d) 생성
-# ───────────────────────────────────────────────────────────────────────
-class DomainInformationEncoder(nn.Module):
-    """
-    DomainInformationEncoder:
-    - featurizer 출력(feature_dim) → 중간 차원(feature_dim//2) → output_dim (context_dim)으로 인코딩
-    - domain-specific context(z_d)를 생성하기 위해 사용
-    """
-    def __init__(self, feature_dim, output_dim, dropout_rate=0.3):
-        super(DomainInformationEncoder, self).__init__()
-        self.encoder = nn.Sequential(
-            nn.Linear(feature_dim, feature_dim // 2),
-            nn.BatchNorm1d(feature_dim // 2),
-            nn.ReLU(inplace=True),
-            nn.Dropout(dropout_rate),
-            nn.Linear(feature_dim // 2, output_dim)
-        )
-
-    def forward(self, z_features):
-        return self.encoder(z_features)  # [B, output_dim]
-
-
-# ───────────────────────────────────────────────────────────────────────
-# FeatureAttention: Multi-Head Attention 기반 특징 가중치 학습
-# ───────────────────────────────────────────────────────────────────────
-class FeatureAttention(nn.Module):
-    """
-    FeatureAttention:
-    - z_query_features: [B, feature_dim]
-    - context_kv_features: [B, context_dim]
-    - MultiHeadAttention + MLP → output_dim 차원 벡터
-    """
-    def __init__(self, feature_dim, context_dim, num_heads, output_dim, dropout_rate=0.3):
-        super(FeatureAttention, self).__init__()
-        # MultiHeadAttention expects (B, L, E) 형태. 여기서는 L=1
-        self.attention = nn.MultiheadAttention(
-            embed_dim=feature_dim,
-            num_heads=num_heads,
-            kdim=context_dim,
-            vdim=context_dim,
-            batch_first=True,
-            dropout=dropout_rate
-        )
-        self.norm1 = nn.LayerNorm(feature_dim)
-        self.mlp = nn.Sequential(
-            nn.Linear(feature_dim, feature_dim * 2),
-            nn.ReLU(inplace=True),
-            nn.Dropout(dropout_rate),
-            nn.Linear(feature_dim * 2, output_dim)
-        )
-        self.norm2 = nn.LayerNorm(output_dim)
-
-    def forward(self, z_query_features, context_kv_features):
-        """
-        z_query_features: [B, feature_dim]
-        context_kv_features: [B, context_dim]
-        """
-        # 1) MultiHeadAttention: (B, L, E) 형태로 차원 확장 (L=1)
-        q = z_query_features.unsqueeze(1)        # [B, 1, feature_dim]
-        kv = context_kv_features.unsqueeze(1)    # [B, 1, context_dim]
-        attn_output, _ = self.attention(q, kv, kv)  # [B, 1, feature_dim]
-        attn_output = attn_output.squeeze(1)        # [B, feature_dim]
-
-        # 2) Residual + LayerNorm
-        z_norm = self.norm1(z_query_features + attn_output)  # [B, feature_dim]
-
-        # 3) MLP → output_dim
-        mlp_out = self.mlp(z_norm)     # [B, output_dim]
-        out = self.norm2(mlp_out)      # [B, output_dim]
-        return out
-
-def gradient_penalty(D, real, fake):
-    # real, fake: [B, D] 형태의 특징 벡터
-    batch_size, feat_dim = real.size()
-    # 1) alpha를 [B,1]로 샘플링
-    alpha = torch.rand(batch_size, 1, device=real.device)
-    # 2) real과 fake 차원에 맞춰 브로드캐스트
-    alpha = alpha.expand(batch_size, feat_dim)  # [B, D]
-    # 3) 인터폴레이션
-    interp = (alpha * real + (1 - alpha) * fake).requires_grad_(True)  # [B, D]
-    # 4) 도메인 분류기 출력
-    logits = D(interp)  # [B, num_domains]
-    # 5) logits 합에 대한 그래디언트
-    grads = torch.autograd.grad(
-        outputs=logits.sum(),    # 스칼라
-        inputs=interp,           # wrt interp
-        create_graph=True
-    )[0]  # grads: [B, D]
-    # 6) 페널티 계산
-    grad_norm = grads.norm(2, dim=1)  # [B]
-    gp = ((grad_norm - 1) ** 2).mean()
-    return gp
-
-
-class MISA(Algorithm):
-    def __init__(self, input_shape, num_classes, num_domains, hparams):
-        super().__init__(input_shape, num_classes, num_domains, hparams)
-        # super(MISA, self).__init__(input_shape, num_classes, num_domains, hparams)
-        
-        self.featurizer = networks.Featurizer(input_shape, self.hparams)
-        self.feature_dim = self.featurizer.n_outputs
-        self.latent_dim = hparams['latent_dim']
-        self.num_heads = hparams['attention_heads']
-        self.dropout_rate = hparams['dropout_rate']
-        
-        # Domain Information Encoder and Feature Attention modules
-        self.die = DomainInformationEncoder(
-            self.feature_dim, 
-            self.feature_dim // 4, 
-            dropout_rate=self.dropout_rate
-        )
-        
-        self.ifa = FeatureAttention(
-            self.feature_dim, 
-            self.feature_dim // 4, 
-            self.num_heads, 
-            self.latent_dim, 
-            dropout_rate=self.dropout_rate
-        )
-        
-        self.sfa = FeatureAttention(
-            self.feature_dim, 
-            self.feature_dim // 4, 
-            self.num_heads, 
-            self.latent_dim, 
-            dropout_rate=self.dropout_rate
-        )
-        
-        # Main classifier for task prediction (using z_inv)
-        self.main_classifier = nn.Sequential(
-            nn.Linear(self.latent_dim, self.latent_dim // 2),
-            nn.BatchNorm1d(self.latent_dim // 2),
-            nn.ReLU(inplace=True),
-            nn.Dropout(self.dropout_rate),
-            nn.Linear(self.latent_dim // 2, num_classes)
-        )
-        
-        # Domain classifier for z_inv (adversarial)
-        # self.domain_classifier_inv = nn.Sequential(
-        #     nn.Linear(self.latent_dim, self.latent_dim // 2),
-        #     nn.BatchNorm1d(self.latent_dim // 2),
-        #     nn.ReLU(inplace=True),
-        #     nn.Dropout(self.dropout_rate),
-        #     nn.Linear(self.latent_dim // 2, num_domains)
-        # )
-
-        self.domain_classifier_inv = nn.Sequential(
-            spectral_norm(nn.Linear(self.latent_dim, self.latent_dim//2)),
-            nn.BatchNorm1d(self.latent_dim//2),
-            nn.ReLU(inplace=True),
-            nn.Dropout(self.dropout_rate),
-            spectral_norm(nn.Linear(self.latent_dim//2, num_domains))
-        )
-        
-        # Domain classifier for z_spc
-        self.domain_classifier_spc = nn.Sequential(
-            nn.Linear(self.latent_dim, self.latent_dim // 2),
-            nn.BatchNorm1d(self.latent_dim // 2),
-            nn.ReLU(inplace=True),
-            nn.Dropout(self.dropout_rate),
-            nn.Linear(self.latent_dim // 2, num_domains)
-        )
-        
-        # Reconstructor for feature reconstruction
-        self.reconstructor = nn.Sequential(
-            nn.Linear(self.latent_dim * 2, self.feature_dim),
-            nn.ReLU(inplace=True),
-            nn.Linear(self.feature_dim, self.feature_dim)
-        )
-        
-        # Spectral loss components
-        if hparams['use_spectral_loss']:
-            self.learnable_gabor = LearnableGaborBank(
-                num_filters=hparams['gabor_num_filters'],
-                kernel_size=hparams['gabor_kernel_size']
-            )
-        
-        # Optimizer 설정 - CLIP 사용 시 다른 learning rate 적용
-        if hparams.get('use_clip', False) and not hparams.get('freeze_clip', True):
-            # CLIP fine-tuning하는 경우 다른 learning rate 사용
-            clip_params = []
-            other_params = []
-            
-            for name, param in self.named_parameters():
-                if 'featurizer.visual_encoder' in name:
-                    clip_params.append(param)
-                else:
-                    other_params.append(param)
-            
-            self.optimizer = torch.optim.Adam([
-                {'params': clip_params, 'lr': hparams.get('lr_clip', 1e-5)},
-                {'params': other_params, 'lr': hparams["lr"]}
-            ], weight_decay=hparams['weight_decay'])
-            
-            print(f"Using separate learning rates: CLIP={hparams.get('lr_clip', 1e-5)}, "
-                  f"Others={hparams['lr']}")
-        else:
-            # 기존 optimizer
-            self.optimizer = torch.optim.Adam(
-                self.parameters(),
-                lr=self.hparams["lr"],
-                weight_decay=self.hparams['weight_decay']
-            )
-        
-        # Register buffer for GRL alpha scheduling
-        self.register_buffer('update_count', torch.tensor([0]))
-        
-    def forward(self, x, grl_alpha=2.0):
-        # Extract features using backbone
-        z_intermediate = self.featurizer(x)
-        
-        # Convert to float32 if using CLIP (which outputs float16)
-        if z_intermediate.dtype == torch.float16:
-            z_intermediate = z_intermediate.float()
-        
-        # Generate domain context features
-        domain_context = self.die(z_intermediate)
-        
-        # Generate domain-invariant and domain-specific features
-        z_inv = self.ifa(z_intermediate, domain_context)
-        z_spc = self.sfa(z_intermediate, domain_context)
-        
-        # Task prediction
-        task_logits = self.main_classifier(z_inv)
-        
-        # Domain prediction for z_inv (with gradient reversal)
-        z_inv_reversed = grad_reverse(z_inv, grl_alpha)
-        domain_logits_inv = self.domain_classifier_inv(z_inv_reversed)
-
-        # Domain prediction for z_spc (without gradient reversal)
-        domain_logits_spc = self.domain_classifier_spc(z_spc)
-        
-        # Feature reconstruction
-        z_combined = torch.cat([z_inv, z_spc], dim=1)
-        z_reconstructed = self.reconstructor(z_combined)
-        
-        return {
-            'task_logits': task_logits,
-            'domain_logits_inv': domain_logits_inv,
-            'domain_logits_spc': domain_logits_spc,
-            'z_inv': z_inv,
-            'z_spc': z_spc,
-            'z_intermediate': z_intermediate,
-            'z_reconstructed': z_reconstructed
-        }
-    
-    def update(self, minibatches, unlabeled=None):
-        # Calculate adaptive GRL alpha
-        if self.hparams['grl_warmup_epochs'] > 0:
-            progress = min(1.0, self.update_count.item() / self.hparams['grl_warmup_epochs'])
-            grl_alpha = (2.0 / (1.0 + np.exp(-10.0 * progress)) - 1.0) * self.hparams['grl_alpha_max']
-        else:
-            grl_alpha = self.hparams['grl_alpha_max']
-        
-        # Concatenate inputs and domain labels
-        all_x = torch.cat([x for x, y in minibatches])
-        all_y = torch.cat([y for x, y in minibatches])
-        all_d = torch.cat([
-            torch.full((x.shape[0],), i, dtype=torch.int64, device=all_x.device)
-            for i, (x, y) in enumerate(minibatches)
-        ])
-        
-        # Forward pass
-        outputs = self.forward(all_x, grl_alpha)
-        
-        # Loss calculation
-        # 1. Task Loss
-        loss_task = F.cross_entropy(outputs['task_logits'], all_y)
-        
-        # 2. Domain Adversarial Loss for z_inv
-        loss_inv_adv = F.cross_entropy(outputs['domain_logits_inv'], all_d)
-        #loss_inv_adv = F.cross_entropy(outputs['domain_logits_inv'], all_d) + 0.1 * outputs['gp']
-
-        # 3. Domain Classification Loss for z_spc
-        loss_spc_clf = F.cross_entropy(outputs['domain_logits_spc'], all_d)
-        
-        # 4. Disentanglement Loss
-        z_inv_norm = F.normalize(outputs['z_inv'], p=2, dim=1)
-        z_spc_norm = F.normalize(outputs['z_spc'], p=2, dim=1)
-        loss_disentangle = torch.mean(torch.sum(z_inv_norm * z_spc_norm, dim=1)**2)
-        
-        # 5. Reconstruction Loss
-        loss_reconstruct = F.mse_loss(outputs['z_reconstructed'], outputs['z_intermediate'])
-        
-        # 6. Spectral Loss (if enabled)
-        loss_spectral_inv = torch.tensor(0.0, device=all_x.device)
-        loss_spectral_spc = torch.tensor(0.0, device=all_x.device)
-        
-        if self.hparams['use_spectral_loss']:
-            # Spectral loss for z_inv (should be domain-invariant)
-            loss_spectral_inv = spectral_loss_gabor_edge_features(
-                outputs['z_inv'], all_d, self.learnable_gabor
-            )
-            
-            # Spectral loss for z_spc (should be domain-specific)
-            spectral_spc_direct = spectral_loss_gabor_edge_features(
-                outputs['z_spc'], all_d, self.learnable_gabor
-            )
-            loss_spectral_spc = invert_spectral_loss(spectral_spc_direct)
-        
-        # Total loss
-        total_loss = (
-            self.hparams['lambda_task'] * loss_task +
-            self.hparams['lambda_inv_adv'] * loss_inv_adv +
-            self.hparams['lambda_spc_clf'] * loss_spc_clf +
-            self.hparams['lambda_disentangle'] * loss_disentangle +
-            self.hparams['lambda_reconstruct'] * loss_reconstruct
-        )
-        
-        if self.hparams['use_spectral_loss']:
-            total_loss += (
-                self.hparams['lambda_spectral_inv'] * loss_spectral_inv +
-                self.hparams['lambda_spectral_spc'] * loss_spectral_spc
-            )
-        
-        # Optimization step
-        self.optimizer.zero_grad()
-        total_loss.backward()
-        torch.nn.utils.clip_grad_norm_(self.parameters(), max_norm=1.0)
-        self.optimizer.step()
-        
-        # Update count
-        self.update_count += 1
-        
-        # Return loss values for logging
-        losses = {
-            'loss': total_loss.item(),
-            'task_loss': loss_task.item(),
-            'inv_adv_loss': loss_inv_adv.item(),
-            'spc_clf_loss': loss_spc_clf.item(),
-            'disentangle_loss': loss_disentangle.item(),
-            'reconstruct_loss': loss_reconstruct.item()
-        }
-        
-        if self.hparams['use_spectral_loss']:
-            losses.update({
-                'spectral_inv_loss': loss_spectral_inv.item(),
-                'spectral_spc_loss': loss_spectral_spc.item()
-            })
-        
-        return losses
-    
-    def predict(self, x):
-        outputs = self.forward(x, grl_alpha=0.0)  # During prediction, no gradient reversal
-        return outputs['task_logits']
-    
-    def train(self, mode=True):
-        """Override train method to handle CLIP freezing"""
-        super().train(mode)
-        # Featurizer의 train method 호출하여 frozen CLIP 처리
-        self.featurizer.train(mode)
-
-
 ####################################################################
 class ForwardModel(nn.Module):
     """Forward model is used to reduce gpu memory usage of SWAD.
@@ -3306,3 +2707,246 @@ class MIRO(Algorithm):
     def get_forward_model(self):
         forward_model = ForwardModel(self.network)
         return forward_model
+
+#####################
+class CLIP(Algorithm):
+    def __init__(self, input_shape, num_classes, num_domains, hparams):
+        super(CLIP, self).__init__(input_shape, num_classes, num_domains, hparams)
+
+        self.hparams = hparams
+        self.device = "cuda" if torch.cuda.is_available() else "cpu"
+
+        if "clip_backbone" not in self.hparams:
+            raise KeyError(
+                "Missing hparams['clip_backbone']. "
+                "Add it to hparams_registry.py or pass it through --hparams."
+            )
+
+        if "class_names" not in self.hparams:
+            raise KeyError(
+                "Missing hparams['class_names']. "
+                "CLIP/DPLCLIP requires dataset class names. "
+                "Inject hparams['class_names'] in train.py after dataset construction "
+                "and before algorithm construction."
+            )
+
+        self.clip_model = clip.load(
+            self.hparams["clip_backbone"],
+            device=self.device
+        )[0].float()
+
+        for param in self.clip_model.parameters():
+            param.requires_grad = False
+
+        print("Set self.clip_model.parameters.requires_grad = False!")
+
+        # OpenAI CLIP ViT-B/16, ViT-B/32, RN50 text/image embedding dimension.
+        self.EMBEDDING_DIM = 512
+
+        # Store class names once and reuse them in CLIP/DPLCLIP.
+        self.classnames = [
+            name.replace("_", " ")
+            for name in self.hparams["class_names"]
+        ]
+
+        self.prompt = torch.cat([
+            clip.tokenize(f"a photo of a {name}")
+            for name in self.classnames
+        ]).to(self.device)
+
+    def update(self, minibatches, unlabeled=None):
+        return {"loss": 0}
+
+    def predict(self, x):
+        x = x.to(self.device).float()
+        logits_per_image, _ = self.clip_model(x, self.prompt)
+        return logits_per_image.softmax(dim=-1)
+
+
+# rename to DPL (Domain Prompt Learning)
+class DPLCLIP(CLIP):
+    def __init__(self, input_shape, num_classes, num_domains, hparams, sentence_prompt=False):
+        super(DPLCLIP, self).__init__(input_shape, num_classes, num_domains, hparams)
+
+        self.num_classes = num_classes
+        self.num_domains = num_domains
+
+        # Initial learnable domain prompt prefix.
+        prompt_prefix = " ".join(["X"] * self.hparams["num_domain_tokens"])
+
+        if sentence_prompt:
+            print("Using sentence_prompt in DPLCLIP...")
+            classnames = [
+                f"a photo of a {name}"
+                for name in self.classnames
+            ]
+        else:
+            classnames = self.classnames
+
+        prompts = [
+            prompt_prefix + " " + name + "."
+            for name in classnames
+        ]
+
+        # Tokenized prompts are used to recover fixed token prefix/suffix.
+        self.tokenized_prompts = torch.cat([
+            clip.tokenize(p)
+            for p in prompts
+        ]).to(self.device)
+
+        with torch.no_grad():
+            embedding = self.clip_model.token_embedding(
+                self.tokenized_prompts
+            ).type(self.clip_model.dtype)
+
+        # SOS token.
+        self.register_buffer("token_prefix", embedding[:, :1, :])
+
+        # Class-name tokens + EOS + padding tokens.
+        self.register_buffer(
+            "token_suffix",
+            embedding[:, self.hparams["num_domain_tokens"] + 1:, :]
+        )
+
+        self.network = networks.MLP(
+            self.EMBEDDING_DIM,
+            self.EMBEDDING_DIM * self.hparams["num_domain_tokens"],
+            self.hparams
+        ).to(device=self.device, dtype=self.clip_model.dtype)
+
+        def init_weights(m):
+            if isinstance(m, nn.Linear):
+                torch.nn.init.xavier_uniform_(m.weight)
+                if m.bias is not None:
+                    m.bias.data.fill_(0.01)
+
+        self.network.apply(init_weights)
+
+        self.optimizer = torch.optim.SGD(
+            self.network.parameters(),
+            lr=self.hparams["lr"],
+            momentum=self.hparams["momentum"],
+            weight_decay=self.hparams.get("weight_decay", 0.0)
+        )
+
+    def update(self, minibatches, unlabeled=None):
+        # minibatches = [(x_domain_1, y_domain_1), (x_domain_2, y_domain_2), ...]
+        all_x = [
+            data[0].to(self.device).float()
+            for data in minibatches
+        ]
+        all_y = torch.cat([
+            data[1].to(self.device).long()
+            for data in minibatches
+        ])
+
+        # CLIP image encoder is frozen. No need to store gradients for it.
+        with torch.no_grad():
+            image_features_per_domain = [
+                self.clip_model.encode_image(x)
+                for x in all_x
+            ]
+
+        # Domain prompt generator is trainable.
+        domain_features = [
+            self.network(feature)
+            for feature in image_features_per_domain
+        ]
+
+        image_features = torch.cat(image_features_per_domain, dim=0)
+
+        # Mean domain feature for each source domain.
+        mean_domain_features = [
+            feature.mean(dim=0, keepdim=True)
+            for feature in domain_features
+        ]
+
+        # Repeat each domain feature by number of classes.
+        repeated_domain_features = [
+            feature.repeat_interleave(len(self.classnames), dim=0)
+            for feature in mean_domain_features
+        ]
+
+        # Text features for all domain-conditioned prompts.
+        text_features = torch.cat([
+            self._get_text_features(feature)
+            for feature in repeated_domain_features
+        ], dim=0)
+
+        image_features = image_features / image_features.norm(dim=-1, keepdim=True)
+        text_features = text_features / text_features.norm(dim=-1, keepdim=True)
+
+        logits_per_image = (
+            self.clip_model.logit_scale.exp()
+            * image_features
+            @ text_features.t()
+        )
+
+        loss = F.cross_entropy(logits_per_image, all_y)
+
+        self.optimizer.zero_grad()
+        loss.backward()
+        self.optimizer.step()
+
+        return {"loss": loss.item()}
+
+    def _get_text_features(self, domain_feature, coop=False):
+        # [num_classes, num_domain_tokens * EMBEDDING_DIM]
+        # -> [num_classes, num_domain_tokens, EMBEDDING_DIM]
+        domain_feature = domain_feature.reshape(
+            -1,
+            self.hparams["num_domain_tokens"],
+            self.EMBEDDING_DIM
+        )
+
+        # [SOS] + [domain prompt tokens] + [class-name/EOS/padding tokens]
+        domain_feature = torch.cat([
+            self.token_prefix,
+            domain_feature,
+            self.token_suffix
+        ], dim=1)
+
+        x = domain_feature + self.clip_model.positional_embedding.type(self.clip_model.dtype)
+
+        x = x.permute(1, 0, 2)  # NLD -> LND
+        x = self.clip_model.transformer(x)
+        x = x.permute(1, 0, 2)  # LND -> NLD
+        x = self.clip_model.ln_final(x).type(self.clip_model.dtype)
+
+        eos_indices = self.tokenized_prompts.argmax(dim=-1)
+
+        text_features = (
+            x[torch.arange(x.shape[0], device=x.device), eos_indices]
+            @ self.clip_model.text_projection
+        )
+
+        return text_features
+
+    def predict(self, x):
+        x = x.to(self.device).float()
+
+        with torch.no_grad():
+            image_feature = self.clip_model.encode_image(x)
+
+        domain_feature = self.network(image_feature)
+
+        mean_domain_feature = (
+            torch.mean(domain_feature, dim=0, keepdim=True)
+            .repeat_interleave(len(self.classnames), dim=0)
+        )
+
+        text_feature = self._get_text_features(mean_domain_feature)
+
+        image_feature = image_feature / image_feature.norm(dim=-1, keepdim=True)
+        text_feature = text_feature / text_feature.norm(dim=-1, keepdim=True)
+
+        return (
+            self.clip_model.logit_scale.exp()
+            * image_feature
+            @ text_feature.t()
+        )
+
+################
+
+
+from domainbed.misa_algorithm import MISA
